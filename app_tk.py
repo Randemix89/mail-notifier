@@ -533,6 +533,7 @@ def parse_smtp_codes(text: str) -> set[int]:
 class SmtpConfig:
     host: str
     port: int
+    use_ssl: bool
     starttls: bool
     verify_tls: bool
     username: str
@@ -610,6 +611,13 @@ class SenderThread(threading.Thread):
         return socks.SOCKS5
 
     def _connect(self, cfg: SmtpConfig, proxy: Optional[ProxyConfig]) -> smtplib.SMTP:
+        def _tls_context() -> ssl.SSLContext:
+            if cfg.verify_tls:
+                if certifi is not None:
+                    return ssl.create_default_context(cafile=certifi.where())
+                return ssl.create_default_context()
+            return ssl._create_unverified_context()
+
         if self.use_proxies and proxy is not None:
             if socks is None:
                 raise RuntimeError("PySocks not installed")
@@ -630,19 +638,33 @@ class SenderThread(threading.Thread):
                     sck.connect((host, port))
                     return sck
 
-            smtp: smtplib.SMTP = _ProxySMTP(cfg.host, cfg.port, timeout=30)
-        else:
-            smtp = smtplib.SMTP(cfg.host, cfg.port, timeout=30)
-        smtp.ehlo()
-        if cfg.starttls:
-            if cfg.verify_tls:
-                if certifi is not None:
-                    ctx = ssl.create_default_context(cafile=certifi.where())
-                else:
-                    ctx = ssl.create_default_context()
+            class _ProxySMTP_SSL(smtplib.SMTP_SSL):
+                def _get_socket(self, host, port, timeout):  # type: ignore[override]
+                    sck = socks.socksocket()
+                    sck.set_proxy(
+                        proxy_type,
+                        proxy.host,
+                        int(proxy.port),
+                        username=(proxy.username or None),
+                        password=(proxy.password or None),
+                    )
+                    sck.settimeout(timeout)
+                    sck.connect((host, port))
+                    ctx = _tls_context()
+                    return ctx.wrap_socket(sck, server_hostname=host)
+
+            if cfg.use_ssl:
+                smtp = _ProxySMTP_SSL(cfg.host, cfg.port, timeout=30, context=_tls_context())
             else:
-                ctx = ssl._create_unverified_context()
-            smtp.starttls(context=ctx)
+                smtp = _ProxySMTP(cfg.host, cfg.port, timeout=30)
+        else:
+            if cfg.use_ssl:
+                smtp = smtplib.SMTP_SSL(cfg.host, cfg.port, timeout=30, context=_tls_context())
+            else:
+                smtp = smtplib.SMTP(cfg.host, cfg.port, timeout=30)
+        smtp.ehlo()
+        if (not cfg.use_ssl) and cfg.starttls:
+            smtp.starttls(context=_tls_context())
             smtp.ehlo()
         smtp.login(cfg.username, cfg.password)
         return smtp
@@ -1283,6 +1305,7 @@ class App:
         proxy_row.pack(fill=BOTH, padx=8, pady=(0, 8))
         ttk.Checkbutton(proxy_row, text="Использовать прокси", variable=self.use_proxies).pack(side=LEFT)
         ttk.Button(proxy_row, text="Загрузить прокси из файла…", command=self.load_proxies).pack(side=LEFT, padx=8)
+        ttk.Button(proxy_row, text="Очистить", command=self.clear_proxies).pack(side=LEFT)
         self.proxy_label = ttk.Label(proxy_row, text=self._proxy_status_text(), anchor="w")
         self.proxy_label.pack(side=LEFT, fill=BOTH, expand=True, padx=8)
 
@@ -1543,6 +1566,7 @@ class App:
         v_provider = StringVar(value=(acc.get("provider") if acc else "Mail.ru"))
         v_host = StringVar(value=(acc.get("host") if acc else PROVIDERS.get(v_provider.get(), PROVIDERS["Custom"])["host"]))
         v_port = StringVar(value=str(acc.get("port") if acc else PROVIDERS.get(v_provider.get(), PROVIDERS["Custom"])["port"]))
+        v_ssl = IntVar(value=int(acc.get("ssl") if acc else 0))
         v_starttls = IntVar(value=int(acc.get("starttls") if acc else 1))
         v_verify = IntVar(value=int(acc.get("verify_tls") if acc else 1))
         v_user = StringVar(value=(acc.get("username") if acc else ""))
@@ -1555,8 +1579,24 @@ class App:
             cfg = PROVIDERS.get(p, PROVIDERS["Custom"])
             if acc is None:
                 v_host.set(cfg["host"])
-                v_port.set(str(cfg["port"]))
-                v_starttls.set(int(cfg["starttls"]))
+                v_port.set(str(465 if v_ssl.get() else cfg["port"]))
+                v_starttls.set(0 if v_ssl.get() else int(cfg["starttls"]))
+
+        def toggle_ssl():
+            # SSL (465) and STARTTLS are mutually exclusive.
+            if v_ssl.get():
+                v_starttls.set(0)
+                if (v_port.get() or "").strip() == "587":
+                    v_port.set("465")
+            else:
+                if (v_port.get() or "").strip() == "465":
+                    v_port.set("587")
+
+        def toggle_starttls():
+            if v_starttls.get():
+                v_ssl.set(0)
+                if (v_port.get() or "").strip() == "465":
+                    v_port.set("587")
 
         frm = Frame(win)
         frm.pack(fill=BOTH, expand=True, padx=10, pady=10)
@@ -1576,7 +1616,8 @@ class App:
 
         r2 = Frame(frm)
         r2.pack(fill=BOTH, pady=4)
-        Checkbutton(r2, text="STARTTLS", variable=v_starttls).pack(side=LEFT)
+        Checkbutton(r2, text="SSL (465)", variable=v_ssl, command=toggle_ssl).pack(side=LEFT)
+        Checkbutton(r2, text="STARTTLS (587)", variable=v_starttls, command=toggle_starttls).pack(side=LEFT, padx=12)
         Checkbutton(r2, text="Проверять TLS", variable=v_verify).pack(side=LEFT, padx=12)
 
         r3 = Frame(frm)
@@ -1633,6 +1674,7 @@ class App:
                 "provider": v_provider.get(),
                 "host": host,
                 "port": port,
+                "ssl": int(v_ssl.get()),
                 "starttls": int(v_starttls.get()),
                 "verify_tls": int(v_verify.get()),
                 "username": user,
@@ -1867,7 +1909,8 @@ class App:
 
     def _proxy_status_text(self) -> str:
         n = len(self.proxies or [])
-        return f"Прокси: {n}"
+        on = bool(self.use_proxies.get())
+        return f"Прокси: {n} ({'ON' if on else 'OFF'})"
 
     def load_proxies(self) -> None:
         path = filedialog.askopenfilename(
@@ -1895,6 +1938,22 @@ class App:
         except Exception:
             pass
         messagebox.showinfo("Прокси", f"Загружено прокси: {len(self.proxies)}")
+
+    def clear_proxies(self) -> None:
+        if not self.proxies:
+            return
+        if not messagebox.askyesno("Прокси", "Удалить все загруженные прокси?"):
+            return
+        self.proxies = []
+        self.cfg["proxies"] = []
+        # Optionally disable proxies as well
+        self.use_proxies.set(0)
+        self.cfg["use_proxies"] = 0
+        save_config(self.cfg)
+        try:
+            self.proxy_label.config(text=self._proxy_status_text())
+        except Exception:
+            pass
 
     def _set_running(self, running: bool) -> None:
         self.btn_start.config(state=("disabled" if running else "normal"))
@@ -1941,6 +2000,7 @@ class App:
         smtp_cfg = SmtpConfig(
             host=str(acc.get("host", "")).strip(),
             port=int(acc.get("port", 587)),
+            use_ssl=bool(int(acc.get("ssl", 0) or 0)),
             starttls=bool(int(acc.get("starttls", 1))),
             verify_tls=bool(int(acc.get("verify_tls", 1))),
             username=str(acc.get("username", "")).strip(),
@@ -1955,6 +2015,7 @@ class App:
                 SmtpConfig(
                     host=str(a.get("host", "")).strip(),
                     port=int(a.get("port", 587)),
+                    use_ssl=bool(int(a.get("ssl", 0) or 0)),
                     starttls=bool(int(a.get("starttls", 1))),
                     verify_tls=bool(int(a.get("verify_tls", 1))),
                     username=str(a.get("username", "")).strip(),
@@ -2209,6 +2270,7 @@ class App:
         smtp_cfg = SmtpConfig(
             host=str(acc.get("host", "")).strip(),
             port=int(acc.get("port", 587)),
+            use_ssl=bool(int(acc.get("ssl", 0) or 0)),
             starttls=bool(int(acc.get("starttls", 1))),
             verify_tls=bool(int(acc.get("verify_tls", 1))),
             username=str(acc.get("username", "")).strip(),
