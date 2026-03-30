@@ -1096,6 +1096,7 @@ class App:
 
         self.stop_event = threading.Event()
         self.sender: Optional[SenderThread] = None
+        self._abort_requested = False
 
         self.cfg = load_config()
         self.theme = StringVar(value=str(self.cfg.get("theme", "dark")))
@@ -1505,11 +1506,13 @@ class App:
         self.btn_continue = ttk.Button(row7, text="Продолжить", command=self.continue_sending, state="disabled")
         self.btn_continue_other = ttk.Button(row7, text="Продолжить с другим аккаунтом…", command=self.continue_with_other_account, state="disabled")
         self.btn_next_account = ttk.Button(row7, text="Следующий аккаунт", command=self.next_account)
+        self.btn_pause = ttk.Button(row7, text="Пауза", command=self.pause, state="disabled")
         self.btn_stop = ttk.Button(row7, text="Стоп", command=self.stop, state="disabled")
         self.btn_start.pack(side=LEFT)
         self.btn_continue.pack(side=LEFT, padx=6)
         self.btn_continue_other.pack(side=LEFT, padx=6)
         self.btn_next_account.pack(side=LEFT, padx=6)
+        self.btn_pause.pack(side=LEFT, padx=6)
         self.btn_stop.pack(side=LEFT, padx=6)
         ttk.Button(row7, text="Тест на email…", command=self.send_test_dialog).pack(side=LEFT, padx=(14, 6))
         ttk.Button(row7, text="Сохранить лог…", command=self.export_log).pack(side=LEFT)
@@ -2249,6 +2252,7 @@ class App:
     def _set_running(self, running: bool) -> None:
         self.btn_start.config(state=("disabled" if running else "normal"))
         self.btn_stop.config(state=("normal" if running else "disabled"))
+        self.btn_pause.config(state=("normal" if running else "disabled"))
         self.btn_continue.config(state=("disabled" if running else ("normal" if self.resume_index > 0 else "disabled")))
         self.btn_continue_other.config(state=("disabled" if running else ("normal" if self.resume_index > 0 else "disabled")))
         self.btn_next_account.config(state=("disabled" if running else "normal"))
@@ -2276,6 +2280,7 @@ class App:
         if reset_log:
             self.tree.delete(*self.tree.get_children())
             self.progress["value"] = 0
+        self._abort_requested = False
         self.stop_event.clear()
         self._set_running(True)
 
@@ -2363,10 +2368,14 @@ class App:
         def on_done(paused: bool, last_idx: int, total: int, keep_current: bool) -> None:
             def _finish():
                 if paused:
-                    # last_idx is 1-based within the slice; if keep_current, retry current recipient
-                    adv = max(0, last_idx - (1 if keep_current else 0))
-                    self.resume_index = min(len(self.emails), self.resume_index + adv)
-                    self._ui_log(now_ts(), "-", f"PAUSED (next index: {self.resume_index + 1})")
+                    if self._abort_requested:
+                        self.resume_index = 0
+                        self._ui_log(now_ts(), "-", "STOPPED")
+                    else:
+                        # last_idx is 1-based within the slice; if keep_current, retry current recipient
+                        adv = max(0, last_idx - (1 if keep_current else 0))
+                        self.resume_index = min(len(self.emails), self.resume_index + adv)
+                        self._ui_log(now_ts(), "-", f"PAUSED (next index: {self.resume_index + 1})")
                 else:
                     self.resume_index = 0
                     self._ui_log(now_ts(), "-", "DONE")
@@ -2652,7 +2661,7 @@ class App:
         def on_progress(_sent: int, _failed: int, _rem: int, _done: int, _total: int) -> None:
             return
 
-        def on_done(_paused: bool, _last_idx: int, _total: int) -> None:
+        def on_done(_paused: bool, _last_idx: int, _total: int, _keep_current: bool) -> None:
             self.root.after(0, lambda: self._ui_log(now_ts(), email, "TEST: done"))
 
         def on_error(msg: str) -> None:
@@ -2699,6 +2708,13 @@ class App:
         t.start()
 
     def stop(self) -> None:
+        # Stop = abort (no resume)
+        self._abort_requested = True
+        self.stop_event.set()
+
+    def pause(self) -> None:
+        # Pause = allow resume
+        self._abort_requested = False
         self.stop_event.set()
 
     def run(self) -> None:
