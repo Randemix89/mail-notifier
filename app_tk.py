@@ -75,6 +75,9 @@ def app_version() -> str:
 PROVIDERS = {
     "Gmail": {"host": "smtp.gmail.com", "port": 587, "starttls": 1},
     "Mail.ru": {"host": "smtp.mail.ru", "port": 587, "starttls": 1},
+    "Yandex": {"host": "smtp.yandex.ru", "port": 587, "starttls": 1},
+    "Rambler": {"host": "smtp.rambler.ru", "port": 587, "starttls": 1},
+    "GMX": {"host": "smtp.gmx.com", "port": 587, "starttls": 1},
     "Custom": {"host": "", "port": 587, "starttls": 1},
 }
 
@@ -93,10 +96,17 @@ def _guess_delimiter(first_line: str) -> Optional[str]:
 
 def _provider_defaults_for_username(username: str) -> dict:
     u = (username or "").strip().lower()
+    # Common providers (used for auto-fill on import)
     if u.endswith("@gmail.com"):
         return {"provider": "Gmail", **PROVIDERS["Gmail"]}
     if u.endswith("@mail.ru") or u.endswith("@inbox.ru") or u.endswith("@bk.ru") or u.endswith("@list.ru"):
         return {"provider": "Mail.ru", **PROVIDERS["Mail.ru"]}
+    if u.endswith("@yandex.ru") or u.endswith("@ya.ru") or u.endswith("@yandex.com"):
+        return {"provider": "Yandex", **PROVIDERS["Yandex"]}
+    if u.endswith("@rambler.ru") or u.endswith("@ro.ru") or u.endswith("@lenta.ru") or u.endswith("@autorambler.ru"):
+        return {"provider": "Rambler", **PROVIDERS["Rambler"]}
+    if u.endswith("@gmx.com") or u.endswith("@gmx.de") or u.endswith("@gmx.net") or u.endswith("@gmx.at") or u.endswith("@gmx.ch"):
+        return {"provider": "GMX", **PROVIDERS["GMX"]}
     return {"provider": "Custom", **PROVIDERS["Custom"]}
 
 
@@ -150,6 +160,9 @@ def read_accounts_from_file(path: str) -> List[dict]:
                     name = str(norm.get("name") or "").strip() or username
                     provider = str(norm.get("provider") or d.get("provider") or "Custom").strip() or "Custom"
                     host = str(norm.get("host") or d.get("host") or "").strip()
+                    if not host:
+                        # Fallback: derive from provider selection
+                        host = str(PROVIDERS.get(provider, {}).get("host") or "").strip()
                     port_raw = str(norm.get("port") or d.get("port") or 587).strip()
                     try:
                         port = int(float(port_raw))
@@ -168,6 +181,11 @@ def read_accounts_from_file(path: str) -> List[dict]:
                     verify_tls = _to_int(norm.get("verify_tls", ""), 1)
                     from_email = str(norm.get("from_email") or "").strip() or username
                     sender_name = str(norm.get("sender_name") or "").strip()
+                    ssl_flag = 0
+                    try:
+                        ssl_flag = int(str(norm.get("ssl") or norm.get("use_ssl") or "").strip() or "0")
+                    except Exception:
+                        ssl_flag = 0
 
                     out.append(
                         {
@@ -175,6 +193,7 @@ def read_accounts_from_file(path: str) -> List[dict]:
                             "provider": provider,
                             "host": host,
                             "port": port,
+                            "ssl": 1 if ssl_flag else 0,
                             "starttls": starttls,
                             "verify_tls": verify_tls,
                             "username": username,
@@ -211,7 +230,7 @@ def read_accounts_from_file(path: str) -> List[dict]:
                     {
                         "name": username,
                         "provider": d["provider"],
-                        "host": d["host"],
+                        "host": str(d.get("host") or "").strip(),
                         "port": int(d["port"]),
                         "starttls": int(d["starttls"]),
                         "verify_tls": 1,
@@ -219,6 +238,7 @@ def read_accounts_from_file(path: str) -> List[dict]:
                         "password": password,
                         "from_email": username,
                         "sender_name": "",
+                        "ssl": 0,
                     }
                 )
     except Exception:
@@ -1186,7 +1206,7 @@ class App:
         box.pack(fill=BOTH, expand=True, padx=8, pady=8)
 
         cols = ("name", "provider", "host", "port", "username", "from")
-        self.acc_tree = ttk.Treeview(box, columns=cols, show="headings", height=14)
+        self.acc_tree = ttk.Treeview(box, columns=cols, show="headings", height=14, selectmode="extended")
         for c, w in zip(cols, (160, 80, 170, 60, 240, 240)):
             self.acc_tree.heading(c, text=c)
             self.acc_tree.column(c, width=w, anchor=W)
@@ -1201,6 +1221,8 @@ class App:
         ttk.Button(btns, text="Добавить", command=self._account_add).pack(side=LEFT)
         ttk.Button(btns, text="Изменить", command=self._account_edit).pack(side=LEFT, padx=6)
         ttk.Button(btns, text="Удалить", command=self._account_delete).pack(side=LEFT)
+        ttk.Button(btns, text="Удалить выбранные", command=self._account_delete_selected).pack(side=LEFT, padx=6)
+        ttk.Button(btns, text="Удалить все", command=self._account_delete_all).pack(side=LEFT, padx=6)
         ttk.Button(btns, text="Импорт из файла…", command=self._account_import).pack(side=LEFT, padx=12)
         ttk.Button(btns, text="Сделать активным", command=self._account_set_active).pack(side=LEFT, padx=12)
         ttk.Label(btns, text="Активный:").pack(side=LEFT, padx=(20, 6))
@@ -1461,6 +1483,40 @@ class App:
         save_config(self.cfg)
         self._refresh_accounts_tree()
 
+    def _account_delete_selected(self) -> None:
+        sel = list(self.acc_tree.selection())
+        if not sel:
+            messagebox.showinfo("Аккаунты", "Выдели один или несколько аккаунтов в списке.")
+            return
+        names: List[str] = []
+        for iid in sel:
+            vals = self.acc_tree.item(iid, "values")
+            if vals:
+                names.append(str(vals[0]))
+        names = [n for n in names if n]
+        if not names:
+            return
+        if not messagebox.askyesno("Удалить", f"Удалить выбранные аккаунты ({len(names)})?"):
+            return
+        self.cfg["accounts"] = [a for a in (self.cfg.get("accounts") or []) if a.get("name") not in set(names)]
+        if self.active_account.get() in set(names):
+            self.active_account.set("")
+            self.cfg["active_account"] = ""
+        save_config(self.cfg)
+        self._refresh_accounts_tree()
+
+    def _account_delete_all(self) -> None:
+        accounts = self.cfg.get("accounts") or []
+        if not accounts:
+            return
+        if not messagebox.askyesno("Удалить", f"Удалить ВСЕ аккаунты ({len(accounts)})?"):
+            return
+        self.cfg["accounts"] = []
+        self.active_account.set("")
+        self.cfg["active_account"] = ""
+        save_config(self.cfg)
+        self._refresh_accounts_tree()
+
     def _account_set_active(self) -> None:
         name = self._selected_account_name()
         if not name:
@@ -1487,9 +1543,15 @@ class App:
             messagebox.showwarning("Импорт", "Не удалось найти аккаунты в файле.\n\nОжидаю формат:\n- email:password (по одной записи на строку)\nили CSV с колонками username/email и password.")
             return
 
+        mode = self._ask_import_mode(total=len(items))
+        if mode is None:
+            return
+
         added = 0
         updated = 0
         accounts = self.cfg.get("accounts") or []
+        if mode == "replace_all":
+            accounts = []
         by_name = {str(a.get("name", "")).strip(): a for a in accounts if isinstance(a, dict) and a.get("name")}
 
         for raw in items:
@@ -1531,6 +1593,7 @@ class App:
                 "provider": provider,
                 "host": host,
                 "port": port,
+                "ssl": int(_int01(raw.get("ssl", raw.get("use_ssl", 0)), 0)),
                 "starttls": int(starttls),
                 "verify_tls": int(verify_tls),
                 "username": username,
@@ -1541,6 +1604,8 @@ class App:
 
             if name in by_name:
                 # Update existing by name
+                if mode == "add_only":
+                    continue
                 by_name[name].update(new_acc)
                 updated += 1
             else:
@@ -1556,6 +1621,50 @@ class App:
         save_config(self.cfg)
         self._refresh_accounts_tree()
         messagebox.showinfo("Импорт", f"Готово.\nДобавлено: {added}\nОбновлено: {updated}\n\nВажно: пароли сохраняются в config.json в открытом виде.")
+
+    def _ask_import_mode(self, *, total: int) -> Optional[str]:
+        """
+        Returns one of: 'add_update' | 'add_only' | 'replace_all' | None (cancel)
+        """
+        win = Toplevel(self.root)
+        win.title("Импорт аккаунтов")
+        win.geometry("520x220")
+        win.transient(self.root)
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+        v = StringVar(value="add_update")
+
+        frm = ttk.Frame(win)
+        frm.pack(fill=BOTH, expand=True, padx=12, pady=12)
+
+        ttk.Label(frm, text=f"Найдено аккаунтов в файле: {total}").pack(anchor="w", pady=(0, 8))
+        ttk.Label(frm, text="Выбери, как применить импорт:").pack(anchor="w", pady=(0, 8))
+
+        ttk.Radiobutton(frm, text="Добавить новые + обновить существующие (по имени)", variable=v, value="add_update").pack(anchor="w")
+        ttk.Radiobutton(frm, text="Только добавить новые (не трогать существующие)", variable=v, value="add_only").pack(anchor="w", pady=(4, 0))
+        ttk.Radiobutton(frm, text="Заменить ВСЕ аккаунты списком из файла", variable=v, value="replace_all").pack(anchor="w", pady=(4, 0))
+
+        out: dict = {"mode": None}
+
+        def ok():
+            out["mode"] = v.get()
+            win.destroy()
+
+        def cancel():
+            out["mode"] = None
+            win.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill=BOTH, pady=(14, 0))
+        ttk.Button(btns, text="Импортировать", command=ok).pack(side=LEFT)
+        ttk.Button(btns, text="Отмена", command=cancel).pack(side=LEFT, padx=8)
+
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        self.root.wait_window(win)
+        return out["mode"]
 
     def _account_dialog(self, acc: Optional[dict]) -> None:
         win = Toplevel(self.root)
