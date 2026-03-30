@@ -1,0 +1,18 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Local state / secrets
+config.json
+_preview.html
+*.log
+
+# Python env / tooling
+.venv/
+.tools/
+
+# Build artifacts
+build/
+dist/
+*.spec
+

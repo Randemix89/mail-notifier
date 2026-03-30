@@ -1,0 +1,37 @@
+{
+  "active_account": "",
+  "active_template": "",
+  "accounts": [
+    {
+      "name": "example",
+      "provider": "Mail.ru",
+      "host": "smtp.mail.ru",
+      "port": 587,
+      "starttls": 1,
+      "verify_tls": 1,
+      "username": "your@mail.ru",
+      "password": "APP_PASSWORD_OR_PASSWORD",
+      "from_email": "your@mail.ru",
+      "sender_name": "support"
+    }
+  ],
+  "templates": [],
+  "rate_per_min": 30,
+  "theme": "dark",
+  "delay_min_s": 1.0,
+  "delay_max_s": 0.0,
+  "sender_name_override": 0,
+  "sender_name_global": "",
+  "rotate_on_451": 0,
+  "rotate_account_on_codes": 0,
+  "rotate_account_codes": "451",
+  "auto_rotate_accounts": 0,
+  "rotate_every_n": 100,
+  "use_proxies": 0,
+  "rotate_proxies": 0,
+  "rotate_proxy_every_n": 20,
+  "rotate_proxy_on_codes": 0,
+  "rotate_proxy_codes": "451",
+  "proxies": []
+}
+
