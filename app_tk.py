@@ -43,6 +43,7 @@ import re
 from email.utils import parseaddr, formataddr
 import webbrowser
 import socket
+import time as _time
 
 try:
     import socks  # type: ignore
@@ -549,6 +550,27 @@ def parse_smtp_codes(text: str) -> set[int]:
     return out
 
 
+def parse_float_relaxed(text: str, default: float) -> float:
+    try:
+        s = str(text or "").strip()
+        if not s:
+            return float(default)
+        # allow comma decimal separator (common in RU locales)
+        s = s.replace(",", ".")
+        return float(s)
+    except Exception:
+        return float(default)
+
+
+@dataclass(frozen=True)
+class TemplateConfig:
+    name: str
+    subject: str
+    body: str
+    is_html: bool
+    batch_n: int
+
+
 @dataclass(frozen=True)
 class SmtpConfig:
     host: str
@@ -572,11 +594,13 @@ class SenderThread(threading.Thread):
         use_proxies: bool,
         rotate_proxy_every_n: int,
         rotate_proxy_on_codes: set[int],
+        templates: List[TemplateConfig],
+        start_template_idx: int,
+        rotate_template_every_n: int,
+        rotate_template_on_codes: set[int],
+        rotate_template_every_s: float,
+        rotate_template_fail_streak_n: int,
         emails: List[str],
-        subject: str,
-        body: str,
-        is_html: bool,
-        variant_batch_n: int,
         autopause_451: bool,
         rotate_on_451: bool,
         rotate_on_codes: set[int],
@@ -600,11 +624,13 @@ class SenderThread(threading.Thread):
         self.use_proxies = bool(use_proxies)
         self.rotate_proxy_every_n = max(0, int(rotate_proxy_every_n))
         self.rotate_proxy_on_codes = set(int(x) for x in (rotate_proxy_on_codes or set()))
+        self.templates = templates
+        self.start_template_idx = max(0, int(start_template_idx))
+        self.rotate_template_every_n = max(0, int(rotate_template_every_n))
+        self.rotate_template_on_codes = set(int(x) for x in (rotate_template_on_codes or set()))
+        self.rotate_template_every_s = max(0.0, float(rotate_template_every_s))
+        self.rotate_template_fail_streak_n = max(0, int(rotate_template_fail_streak_n))
         self.emails = emails
-        self.subject = subject
-        self.body = body
-        self.is_html = is_html
-        self.variant_batch_n = max(0, int(variant_batch_n))
         self.autopause_451 = bool(autopause_451)
         self.rotate_on_451 = bool(rotate_on_451)
         self.rotate_on_codes = set(int(x) for x in (rotate_on_codes or set()))
@@ -731,6 +757,7 @@ class SenderThread(threading.Thread):
         failure_streak = 0
         sent_since_rotate = 0
         sent_since_proxy_rotate = 0
+        sent_since_template_rotate = 0
 
         smtp_cfgs = [c for c in (self.smtp_cfgs or []) if isinstance(c, SmtpConfig)]
         if not smtp_cfgs:
@@ -745,6 +772,15 @@ class SenderThread(threading.Thread):
         if self.use_proxies and proxies:
             proxy_idx = 0
             cur_proxy = proxies[proxy_idx]
+
+        templates = [t for t in (self.templates or []) if isinstance(t, TemplateConfig) and t.name]
+        if not templates:
+            self.on_error("Нет шаблонов для отправки.")
+            return
+        tpl_idx = self.start_template_idx % len(templates)
+        cur_tpl = templates[tpl_idx]
+        tpl_fail_streak = 0
+        last_tpl_switch_ts = _time.monotonic()
 
         try:
             if self.use_proxies and proxies:
@@ -775,12 +811,23 @@ class SenderThread(threading.Thread):
                     self.on_progress(sent, failed, remaining, i, total)
                     continue
 
-                top_idx: Optional[int] = None
-                if self.variant_batch_n > 0:
-                    top_idx = (i - 1) // self.variant_batch_n
+                # Time-based template rotation (before building message)
+                if self.rotate_template_every_s > 0 and len(templates) >= 2:
+                    now = _time.monotonic()
+                    if (now - last_tpl_switch_ts) >= float(self.rotate_template_every_s):
+                        tpl_idx = (tpl_idx + 1) % len(templates)
+                        cur_tpl = templates[tpl_idx]
+                        tpl_fail_streak = 0
+                        last_tpl_switch_ts = now
+                        sent_since_template_rotate = 0
+                        self.on_log(now_ts(), "-", f"AUTO-SWITCH TEMPLATE (time) -> {cur_tpl.name}")
 
-                subj = apply_variants(self.subject, top_index=top_idx)
-                body = apply_variants(self.body, top_index=top_idx)
+                top_idx: Optional[int] = None
+                if cur_tpl.batch_n > 0:
+                    top_idx = (i - 1) // int(cur_tpl.batch_n)
+
+                subj = apply_variants(cur_tpl.subject, top_index=top_idx)
+                body = apply_variants(cur_tpl.body, top_index=top_idx)
 
                 msg = build_message(
                     from_email=cur_cfg.from_email,
@@ -788,7 +835,7 @@ class SenderThread(threading.Thread):
                     to_email=norm_to,
                     subject=subj,
                     body=body,
-                    is_html=self.is_html,
+                    is_html=bool(cur_tpl.is_html),
                     attachments=self.attachments,
                 )
                 send_ok = False
@@ -800,13 +847,37 @@ class SenderThread(threading.Thread):
                         sent += 1
                         sent_since_rotate += 1
                         sent_since_proxy_rotate += 1
+                        sent_since_template_rotate += 1
                         self.on_log(now_ts(), to_email, "SENT")
                         send_ok = True
                         failure_streak = 0
+                        tpl_fail_streak = 0
                         break
                     except smtplib.SMTPResponseException as e:
                         code = int(getattr(e, "smtp_code", 0) or 0)
                         msg_txt = str(getattr(e, "smtp_error", b"") or b"")
+                        if code and (code in self.rotate_template_on_codes) and len(templates) >= 2:
+                            tpl_idx = (tpl_idx + 1) % len(templates)
+                            cur_tpl = templates[tpl_idx]
+                            sent_since_template_rotate = 0
+                            tpl_fail_streak = 0
+                            last_tpl_switch_ts = _time.monotonic()
+                            self.on_log(now_ts(), to_email, f"SWITCH TEMPLATE due to ({code}) -> {cur_tpl.name} (attempt {attempts}/3)")
+                            top_idx = None
+                            if cur_tpl.batch_n > 0:
+                                top_idx = (i - 1) // int(cur_tpl.batch_n)
+                            subj = apply_variants(cur_tpl.subject, top_index=top_idx)
+                            body = apply_variants(cur_tpl.body, top_index=top_idx)
+                            msg = build_message(
+                                from_email=cur_cfg.from_email,
+                                from_name=cur_cfg.from_name,
+                                to_email=norm_to,
+                                subject=subj,
+                                body=body,
+                                is_html=bool(cur_tpl.is_html),
+                                attachments=self.attachments,
+                            )
+                            continue
                         if (
                             code
                             and (code in self.rotate_proxy_on_codes)
@@ -890,7 +961,15 @@ class SenderThread(threading.Thread):
                             continue
                         failed += 1
                         failure_streak += 1
+                        tpl_fail_streak += 1
                         self.on_log(now_ts(), to_email, f"FAILED: ({code}) {msg_txt or e}")
+                        if self.rotate_template_fail_streak_n > 0 and tpl_fail_streak >= self.rotate_template_fail_streak_n and len(templates) >= 2:
+                            tpl_idx = (tpl_idx + 1) % len(templates)
+                            cur_tpl = templates[tpl_idx]
+                            tpl_fail_streak = 0
+                            last_tpl_switch_ts = _time.monotonic()
+                            sent_since_template_rotate = 0
+                            self.on_log(now_ts(), to_email, f"SWITCH TEMPLATE due to failures -> {cur_tpl.name}")
                         try:
                             smtp.quit()
                         except Exception:
@@ -908,7 +987,15 @@ class SenderThread(threading.Thread):
                     except Exception as e:
                         failed += 1
                         failure_streak += 1
+                        tpl_fail_streak += 1
                         self.on_log(now_ts(), to_email, f"FAILED: {e}")
+                        if self.rotate_template_fail_streak_n > 0 and tpl_fail_streak >= self.rotate_template_fail_streak_n and len(templates) >= 2:
+                            tpl_idx = (tpl_idx + 1) % len(templates)
+                            cur_tpl = templates[tpl_idx]
+                            tpl_fail_streak = 0
+                            last_tpl_switch_ts = _time.monotonic()
+                            sent_since_template_rotate = 0
+                            self.on_log(now_ts(), to_email, f"SWITCH TEMPLATE due to failures -> {cur_tpl.name}")
                         try:
                             smtp.quit()
                         except Exception:
@@ -971,6 +1058,15 @@ class SenderThread(threading.Thread):
                         failure_streak += 1
                         self.on_log(now_ts(), "-", f"FAILED SWITCH PROXY: {e}")
 
+                # Auto-rotate template after N successful sends
+                if self.rotate_template_every_n > 0 and len(templates) >= 2 and sent_since_template_rotate >= self.rotate_template_every_n:
+                    sent_since_template_rotate = 0
+                    tpl_idx = (tpl_idx + 1) % len(templates)
+                    cur_tpl = templates[tpl_idx]
+                    tpl_fail_streak = 0
+                    last_tpl_switch_ts = _time.monotonic()
+                    self.on_log(now_ts(), "-", f"AUTO-SWITCH TEMPLATE -> {cur_tpl.name}")
+
                 remaining = max(0, total - i)
                 self.on_progress(sent, failed, remaining, i, total)
 
@@ -1008,6 +1104,14 @@ class App:
 
         self.active_account = StringVar(value=self.cfg.get("active_account", ""))
         self.active_template = StringVar(value=self.cfg.get("active_template", ""))
+        self.use_multiple_templates = IntVar(value=int(self.cfg.get("use_multiple_templates", 0)))
+        self.rotate_templates = IntVar(value=int(self.cfg.get("rotate_templates", 0)))
+        self.rotate_template_every_n = StringVar(value=str(self.cfg.get("rotate_template_every_n", 50)))
+        self.rotate_template_every_s = StringVar(value=str(self.cfg.get("rotate_template_every_s", 0)))
+        self.rotate_template_on_fail_streak = IntVar(value=int(self.cfg.get("rotate_template_on_fail_streak", 0)))
+        self.rotate_template_fail_streak_n = StringVar(value=str(self.cfg.get("rotate_template_fail_streak_n", 3)))
+        self.rotate_template_on_codes = IntVar(value=int(self.cfg.get("rotate_template_on_codes", 0)))
+        self.rotate_template_codes = StringVar(value=str(self.cfg.get("rotate_template_codes", "451")))
 
         self.csv_path: Optional[str] = None
         self.emails: List[str] = []
@@ -1296,7 +1400,32 @@ class App:
         ttk.Label(r, text="Шаблон:").pack(side=LEFT, padx=(14, 0))
         self.send_template_cb = ttk.Combobox(r, textvariable=self.active_template, values=[], state="readonly", width=24)
         self.send_template_cb.pack(side=LEFT, padx=6)
+        ttk.Checkbutton(r, text="несколько", variable=self.use_multiple_templates, command=self._toggle_multi_templates_ui).pack(side=LEFT, padx=8)
         ttk.Button(r, text="Обновить списки", command=self._refresh_send_selectors).pack(side=RIGHT)
+
+        self.multi_tpl_box = ttk.LabelFrame(top, text="Шаблоны (Ctrl/Shift для нескольких)")
+        self.multi_tpl_box.pack(fill=BOTH, padx=0, pady=(8, 0))
+        self.tpl_send_list = Listbox(self.multi_tpl_box, height=5, selectmode="extended")
+        self.tpl_send_list.pack(side=LEFT, fill=BOTH, expand=True, padx=(8, 0), pady=8)
+        sb_tpl = Scrollbar(self.multi_tpl_box, orient=VERTICAL, command=self.tpl_send_list.yview)
+        self.tpl_send_list.configure(yscrollcommand=sb_tpl.set)
+        sb_tpl.pack(side=RIGHT, fill="y", pady=8, padx=(0, 8))
+
+        tpl_rot = Frame(self.multi_tpl_box)
+        tpl_rot.pack(fill=BOTH, padx=8, pady=(0, 8))
+        ttk.Checkbutton(tpl_rot, text="Авто-смена шаблона каждые N отправок:", variable=self.rotate_templates).pack(side=LEFT)
+        ttk.Entry(tpl_rot, textvariable=self.rotate_template_every_n, width=6).pack(side=LEFT, padx=6)
+        ttk.Label(tpl_rot, text="(успешных)").pack(side=LEFT, padx=6)
+        ttk.Checkbutton(tpl_rot, text="и/или по SMTP кодам:", variable=self.rotate_template_on_codes).pack(side=LEFT, padx=(16, 0))
+        ttk.Entry(tpl_rot, textvariable=self.rotate_template_codes, width=16).pack(side=LEFT, padx=6)
+
+        tpl_rot2 = Frame(self.multi_tpl_box)
+        tpl_rot2.pack(fill=BOTH, padx=8, pady=(0, 8))
+        ttk.Label(tpl_rot2, text="Смена по времени (сек):").pack(side=LEFT)
+        ttk.Entry(tpl_rot2, textvariable=self.rotate_template_every_s, width=6).pack(side=LEFT, padx=6)
+        ttk.Checkbutton(tpl_rot2, text="Смена при ошибках подряд:", variable=self.rotate_template_on_fail_streak).pack(side=LEFT, padx=(16, 0))
+        ttk.Entry(tpl_rot2, textvariable=self.rotate_template_fail_streak_n, width=4).pack(side=LEFT, padx=6)
+        ttk.Label(tpl_rot2, text="(шт)").pack(side=LEFT, padx=6)
 
         r2 = Frame(sel)
         r2.pack(fill=BOTH, padx=8, pady=(0, 6))
@@ -1413,12 +1542,36 @@ class App:
         sb2.pack(side=RIGHT, fill="y")
 
         self._refresh_send_selectors()
+        self._toggle_multi_templates_ui()
+
+    def _toggle_multi_templates_ui(self) -> None:
+        try:
+            if self.use_multiple_templates.get():
+                self.multi_tpl_box.pack(fill=BOTH, padx=0, pady=(8, 0))
+                self.send_template_cb.configure(state="disabled")
+            else:
+                self.multi_tpl_box.pack_forget()
+                self.send_template_cb.configure(state="readonly")
+        except Exception:
+            pass
 
     def _refresh_send_selectors(self) -> None:
         acc_names = [a.get("name", "") for a in (self.cfg.get("accounts") or []) if a.get("name")]
         tpl_names = [t.get("name", "") for t in (self.cfg.get("templates") or []) if t.get("name")]
         self.send_account_cb["values"] = acc_names
         self.send_template_cb["values"] = tpl_names
+
+        try:
+            self.tpl_send_list.delete(0, END)
+            for n in tpl_names:
+                self.tpl_send_list.insert(END, n)
+            # preselect active template in list
+            if self.active_template.get() in tpl_names:
+                idx = tpl_names.index(self.active_template.get())
+                self.tpl_send_list.selection_set(idx)
+                self.tpl_send_list.see(idx)
+        except Exception:
+            pass
 
         if self.active_account.get() not in acc_names and acc_names:
             self.active_account.set(acc_names[0])
@@ -1983,6 +2136,12 @@ class App:
             return "Выбери активный SMTP аккаунт (вкладка Аккаунты)."
         if not self.active_template.get().strip():
             return "Выбери активный шаблон (вкладка Шаблоны)."
+        if self.use_multiple_templates.get():
+            try:
+                if not list(self.tpl_send_list.curselection()):
+                    return "Выбери один или несколько шаблонов (Ctrl/Shift)."
+            except Exception:
+                return "Выбери один или несколько шаблонов (Ctrl/Shift)."
         try:
             int(self.rate.get())
         except Exception:
@@ -2014,6 +2173,29 @@ class App:
                 codes = parse_smtp_codes(self.rotate_proxy_codes.get())
                 if not codes:
                     return "Укажи SMTP-коды для переключения прокси (например: 451,421)."
+        if self.use_multiple_templates.get():
+            if self.rotate_templates.get():
+                try:
+                    n = int(self.rotate_template_every_n.get() or "0")
+                except Exception:
+                    return "N для авто-смены шаблона должно быть числом."
+                if n <= 0:
+                    return "N для авто-смены шаблона должно быть > 0."
+            # time-based (allow float seconds)
+            tsec = parse_float_relaxed(self.rotate_template_every_s.get(), 0.0)
+            if tsec < 0:
+                return "Время для авто-смены шаблона должно быть >= 0."
+            if self.rotate_template_on_fail_streak.get():
+                try:
+                    n = int(self.rotate_template_fail_streak_n.get() or "0")
+                except Exception:
+                    return "Ошибки подряд для смены шаблона должно быть числом."
+                if n <= 0:
+                    return "Ошибки подряд для смены шаблона должно быть > 0."
+            if self.rotate_template_on_codes.get():
+                codes = parse_smtp_codes(self.rotate_template_codes.get())
+                if not codes:
+                    return "Укажи SMTP-коды для переключения шаблона (например: 451,421)."
         return None
 
     def _proxy_status_text(self) -> str:
@@ -2151,15 +2333,15 @@ class App:
         rotate_codes = parse_smtp_codes(self.rotate_account_codes.get()) if self.rotate_account_on_codes.get() else set()
 
         try:
-            dmin = float(self.delay_min_s.get() or "0")
-            dmax = float(self.delay_max_s.get() or "0")
+            dmin = parse_float_relaxed(self.delay_min_s.get(), 0.0)
+            dmax = parse_float_relaxed(self.delay_max_s.get(), 0.0)
         except Exception:
             messagebox.showwarning("Проверка", "Задержка мин/макс должна быть числом (сек).")
             self._set_running(False)
             return
 
         try:
-            pause451 = float(self.pause_451_s.get() or "120")
+            pause451 = parse_float_relaxed(self.pause_451_s.get(), 120.0)
         except Exception:
             messagebox.showwarning("Проверка", "Пауза при 451 должна быть числом (сек).")
             self._set_running(False)
@@ -2196,6 +2378,57 @@ class App:
             self.root.after(0, lambda: (self._ui_log(now_ts(), "-", f"ERROR: {msg}"), messagebox.showerror("Ошибка", msg), self._set_running(False)))
 
         send_list = self.emails[self.resume_index :]
+
+        # Build template rotation set
+        templates_all = [t for t in (self.cfg.get("templates") or []) if isinstance(t, dict) and t.get("name")]
+        tpl_by_name = {str(t.get("name")): t for t in templates_all}
+        selected_tpl_names: List[str] = []
+        if self.use_multiple_templates.get():
+            try:
+                idxs = list(self.tpl_send_list.curselection())
+                names_all = [x.get("name", "") for x in templates_all]
+                for idx in idxs:
+                    if 0 <= idx < len(names_all):
+                        selected_tpl_names.append(str(names_all[idx]))
+            except Exception:
+                selected_tpl_names = []
+        if not selected_tpl_names:
+            selected_tpl_names = [tpl_name]
+
+        tpl_cfgs: List[TemplateConfig] = []
+        for nm in selected_tpl_names:
+            t = tpl_by_name.get(nm)
+            if not t:
+                continue
+            tpl_cfgs.append(
+                TemplateConfig(
+                    name=str(t.get("name", "")),
+                    subject=str(t.get("subject", "")).strip(),
+                    body=str(t.get("body", "")),
+                    is_html=bool(int(t.get("is_html", 1) or 0)),
+                    batch_n=int(t.get("batch_n", 0) or 0),
+                )
+            )
+        if not tpl_cfgs and tpl:
+            tpl_cfgs = [
+                TemplateConfig(
+                    name=str(tpl.get("name", "")) or "template",
+                    subject=str(tpl.get("subject", "")).strip(),
+                    body=str(tpl.get("body", "")),
+                    is_html=bool(int(tpl.get("is_html", 1) or 0)),
+                    batch_n=int(tpl.get("batch_n", 0) or 0),
+                )
+            ]
+
+        start_tpl_idx = 0
+        if self.use_multiple_templates.get() and tpl_cfgs:
+            # start from first selected
+            start_tpl_idx = 0
+        rotate_tpl_n = int(self.rotate_template_every_n.get() or "0") if (self.use_multiple_templates.get() and self.rotate_templates.get()) else 0
+        rotate_tpl_codes = parse_smtp_codes(self.rotate_template_codes.get()) if (self.use_multiple_templates.get() and self.rotate_template_on_codes.get()) else set()
+        rotate_tpl_s = parse_float_relaxed(self.rotate_template_every_s.get(), 0.0) if self.use_multiple_templates.get() else 0.0
+        rotate_tpl_fail_n = int(self.rotate_template_fail_streak_n.get() or "0") if (self.use_multiple_templates.get() and self.rotate_template_on_fail_streak.get()) else 0
+
         self.sender = SenderThread(
             smtp_cfgs=smtp_cfgs,
             start_smtp_idx=start_idx,
@@ -2204,11 +2437,13 @@ class App:
             use_proxies=bool(self.use_proxies.get()),
             rotate_proxy_every_n=(int(self.rotate_proxy_every_n.get() or "0") if self.rotate_proxies.get() else 0),
             rotate_proxy_on_codes=(parse_smtp_codes(self.rotate_proxy_codes.get()) if self.rotate_proxy_on_codes.get() else set()),
+            templates=tpl_cfgs,
+            start_template_idx=start_tpl_idx,
+            rotate_template_every_n=rotate_tpl_n,
+            rotate_template_on_codes=rotate_tpl_codes,
+            rotate_template_every_s=rotate_tpl_s,
+            rotate_template_fail_streak_n=rotate_tpl_fail_n,
             emails=send_list,
-            subject=str(tpl.get("subject", "")).strip(),
-            body=str(tpl.get("body", "")),
-            is_html=bool(int(tpl.get("is_html", 1))),
-            variant_batch_n=int(tpl.get("batch_n", 0) or 0),
             autopause_451=bool(self.autopause_451.get()),
             rotate_on_451=bool(self.rotate_on_451.get()),
             rotate_on_codes=rotate_codes,
@@ -2252,6 +2487,17 @@ class App:
             self.cfg["rotate_proxy_every_n"] = 0
         self.cfg["rotate_proxy_on_codes"] = int(self.rotate_proxy_on_codes.get())
         self.cfg["rotate_proxy_codes"] = self.rotate_proxy_codes.get()
+        self.cfg["use_multiple_templates"] = int(self.use_multiple_templates.get())
+        self.cfg["rotate_templates"] = int(self.rotate_templates.get())
+        self.cfg["rotate_template_every_n"] = int(self.rotate_template_every_n.get() or "0")
+        self.cfg["rotate_template_on_codes"] = int(self.rotate_template_on_codes.get())
+        self.cfg["rotate_template_codes"] = self.rotate_template_codes.get()
+        self.cfg["rotate_template_every_s"] = parse_float_relaxed(self.rotate_template_every_s.get(), 0.0)
+        self.cfg["rotate_template_on_fail_streak"] = int(self.rotate_template_on_fail_streak.get())
+        try:
+            self.cfg["rotate_template_fail_streak_n"] = int(self.rotate_template_fail_streak_n.get() or "0")
+        except Exception:
+            self.cfg["rotate_template_fail_streak_n"] = 0
         try:
             self.cfg["rotate_every_n"] = int(self.rotate_every_n.get() or "0")
         except Exception:
@@ -2389,9 +2635,9 @@ class App:
         )
 
         try:
-            dmin = float(self.delay_min_s.get() or "0")
-            dmax = float(self.delay_max_s.get() or "0")
-            pause451 = float(self.pause_451_s.get() or "120")
+            dmin = parse_float_relaxed(self.delay_min_s.get(), 0.0)
+            dmax = parse_float_relaxed(self.delay_max_s.get(), 0.0)
+            pause451 = parse_float_relaxed(self.pause_451_s.get(), 120.0)
         except Exception:
             dmin = dmax = 0.0
             pause451 = 120.0
@@ -2416,15 +2662,30 @@ class App:
             smtp_cfgs=[smtp_cfg],
             start_smtp_idx=0,
             rotate_every_n=0,
+            proxies=[],
+            use_proxies=False,
+            rotate_proxy_every_n=0,
+            rotate_proxy_on_codes=set(),
+            templates=[
+                TemplateConfig(
+                    name=str(tpl.get("name", "")) or "template",
+                    subject=str(tpl.get("subject", "")).strip(),
+                    body=str(tpl.get("body", "")),
+                    is_html=bool(int(tpl.get("is_html", 1) or 0)),
+                    batch_n=int(tpl.get("batch_n", 0) or 0),
+                )
+            ],
+            start_template_idx=0,
+            rotate_template_every_n=0,
+            rotate_template_on_codes=set(),
+            rotate_template_every_s=0.0,
+            rotate_template_fail_streak_n=0,
             emails=[email],
-            subject=str(tpl.get("subject", "")).strip(),
-            body=str(tpl.get("body", "")),
-            is_html=bool(int(tpl.get("is_html", 1))),
-            variant_batch_n=int(tpl.get("batch_n", 0) or 0),
             autopause_451=bool(self.autopause_451.get()),
             rotate_on_451=False,
             rotate_on_codes=set(),
             pause_451_s=pause451,
+            failure_pause_threshold=0,
             attachments=self._get_attachments(),
             emails_per_minute=1,
             delay_min_s=dmin,
