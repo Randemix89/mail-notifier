@@ -1163,7 +1163,96 @@ class App:
 
         self._build_menu()
         self._build_ui()
+        self._setup_rate_delay_sync()
         self._bind_clipboard_shortcuts()
+
+    def _setup_rate_delay_sync(self) -> None:
+        """
+        Keep "emails/min" and "delay (sec)" in sync.
+
+        - Changing rate recalculates delay to match it.
+        - Changing delay recalculates rate to match it.
+        """
+
+        self._rate_delay_sync_lock = False
+
+        def _fmt_delay(v: float) -> str:
+            if v <= 0:
+                return "0"
+            s = f"{v:.3f}".rstrip("0").rstrip(".")
+            return s or "0"
+
+        def _parse_int_relaxed(text: str, default: int) -> int:
+            try:
+                s = str(text or "").strip()
+                if not s:
+                    return int(default)
+                return int(float(s))
+            except Exception:
+                return int(default)
+
+        def _sync_from_rate() -> None:
+            if self._rate_delay_sync_lock:
+                return
+            self._rate_delay_sync_lock = True
+            try:
+                epm = max(1, _parse_int_relaxed(self.rate.get(), 30))
+                d = 60.0 / float(epm)
+                # In SenderThread: delay_max_s==0 means fixed delay == delay_min_s.
+                self.delay_min_s.set(_fmt_delay(d))
+                # UX: allow leaving "max" empty (treated as 0.0).
+                self.delay_max_s.set("")
+            finally:
+                self._rate_delay_sync_lock = False
+
+        def _sync_from_delay() -> None:
+            if self._rate_delay_sync_lock:
+                return
+            self._rate_delay_sync_lock = True
+            try:
+                dmin = max(0.0, parse_float_relaxed(self.delay_min_s.get(), 0.0))
+                dmax = max(0.0, parse_float_relaxed(self.delay_max_s.get(), 0.0))
+
+                if dmin <= 0 and dmax <= 0:
+                    # No custom delay -> keep fields consistent with current rate.
+                    epm = max(1, _parse_int_relaxed(self.rate.get(), 30))
+                    d = 60.0 / float(epm)
+                    self.delay_min_s.set(_fmt_delay(d))
+                    self.delay_max_s.set("")
+                    return
+
+                # Effective delay for computing rate:
+                # - fixed delay: dmin
+                # - range: mean(min,max)
+                if dmax > 0:
+                    a = min(dmin, dmax) if dmin > 0 else dmax
+                    b = max(dmin, dmax)
+                    eff = (a + b) / 2.0
+                else:
+                    eff = dmin
+
+                if eff <= 0:
+                    return
+                epm = max(1, int(round(60.0 / float(eff))))
+                self.rate.set(str(epm))
+            finally:
+                self._rate_delay_sync_lock = False
+
+        try:
+            self.rate.trace_add("write", lambda *_: _sync_from_rate())
+            self.delay_min_s.trace_add("write", lambda *_: _sync_from_delay())
+            self.delay_max_s.trace_add("write", lambda *_: _sync_from_delay())
+        except Exception:
+            # Older Tk versions may not support trace_add.
+            try:
+                self.rate.trace("w", lambda *_: _sync_from_rate())
+                self.delay_min_s.trace("w", lambda *_: _sync_from_delay())
+                self.delay_max_s.trace("w", lambda *_: _sync_from_delay())
+            except Exception:
+                return
+
+        # Ensure initial values are consistent.
+        _sync_from_rate()
 
     def _apply_theme(self) -> None:
         if sv_ttk is None:
@@ -2651,12 +2740,18 @@ class App:
             dmin = dmax = 0.0
             pause451 = 120.0
 
+        try:
+            epm = int(float(str(self.rate.get() or "").strip() or "1"))
+        except Exception:
+            epm = 1
+        epm = max(1, epm)
+
         self._ui_log(now_ts(), email, "TEST: queued")
 
         stop_ev = threading.Event()
 
         def on_log(ts: str, em: str, status: str) -> None:
-            self.root.after(0, lambda: self._ui_log(ts, em, "TEST: " + status if status == "SENT" else status))
+            self.root.after(0, lambda: self._ui_log(ts, em, "TEST: " + str(status)))
 
         def on_progress(_sent: int, _failed: int, _rem: int, _done: int, _total: int) -> None:
             return
@@ -2696,7 +2791,7 @@ class App:
             pause_451_s=pause451,
             failure_pause_threshold=0,
             attachments=self._get_attachments(),
-            emails_per_minute=1,
+            emails_per_minute=epm,
             delay_min_s=dmin,
             delay_max_s=dmax,
             stop_event=stop_ev,
